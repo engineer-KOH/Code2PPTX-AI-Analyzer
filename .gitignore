@@ -1,0 +1,16 @@
+# 環境変数・機密情報
+.env
+lineworks_bot_ID.txt
+
+# フォルダ・出力物
+inputs/*
+outputs/*
+__pycache__/
+
+# 各種エクセル・ドキュメント・検証シート（社内用）
+事前実行が必要.txt
+*.xlsx
+*.xlsm
+*.xls
+*.csv
+*.pptx
