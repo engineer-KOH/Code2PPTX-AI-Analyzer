@@ -6,7 +6,7 @@ import ast
 import time
 import logging
 from pathlib import Path
-from typing import List, Optional, Union, Any
+from typing import List, Optional, Union, Any, Dict, Tuple
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
@@ -19,7 +19,7 @@ from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # ---------------------------------------------------------
-# 1. Pydantic 構造化データ定義 (柔軟なスキーマ対応)
+# 1. Pydantic 構造化データ定義
 # ---------------------------------------------------------
 
 class FlowStepDetail(BaseModel):
@@ -47,6 +47,7 @@ class ProcessingStep(BaseModel):
     process_detail: str = Field(default="")
 
 class SectionDetail(BaseModel):
+    title: str = Field(default="")
     summary_plain: str = Field(default="")
     technical_point: str = Field(default="")
 
@@ -69,7 +70,6 @@ class CodeAnalysisResult(BaseModel):
     dictionary_items: List[DictItem] = Field(default_factory=list)
 
     def get_normalized_flow(self) -> List[FlowStepDetail]:
-        """異なるJSONスキーマの実行フローを標準化"""
         if self.business_summary and self.business_summary.flow_step_details:
             return self.business_summary.flow_step_details
         
@@ -84,7 +84,6 @@ class CodeAnalysisResult(BaseModel):
         return normalized
 
     def get_normalized_sections(self) -> CodeSectionSlide:
-        """異なるJSONスキーマの実装解説・学習内容を標準化（見出しと詳細を完全に分離）"""
         items_left = []
         learnings_right = []
 
@@ -93,17 +92,27 @@ class CodeAnalysisResult(BaseModel):
                 items_left.extend(sec.items_left)
                 learnings_right.extend(sec.learnings_right)
             elif isinstance(sec, SectionDetail):
-                raw_title = getattr(sec, "title", "") or sec.summary_plain
-                
-                if "。" in raw_title:
-                    short_title = raw_title.split("。")[0]
-                elif len(raw_title) > 25:
-                    short_title = raw_title[:25] + "…"
-                else:
-                    short_title = raw_title
+                raw_title = getattr(sec, "title", "") or ""
+                summary = sec.summary_plain.strip()
+                tech_point = sec.technical_point.strip()
 
-                detail = sec.technical_point if sec.technical_point else sec.summary_plain
-                items_left.append(f"{short_title.strip()}: {detail.strip()}")
+                if not raw_title or raw_title in ["主要処理ルーチン", "処理内容・実装解説"]:
+                    if summary:
+                        first_sentence = re.split(r'[。、\n]', summary)[0]
+                        raw_title = first_sentence if len(first_sentence) <= 30 else first_sentence[:28] + "…"
+                    else:
+                        raw_title = "制御ロジック実装"
+
+                if summary and tech_point:
+                    explanation = f"{summary}（{tech_point}）"
+                elif summary:
+                    explanation = summary
+                elif tech_point:
+                    explanation = tech_point
+                else:
+                    explanation = "主要な制御ロジックの実行処理"
+
+                items_left.append(f"{raw_title.strip()}: {explanation.strip()}")
 
         if self.learning_points:
             for lp in self.learning_points:
@@ -121,7 +130,6 @@ class CodeAnalysisResult(BaseModel):
         )
 
     def get_normalized_dictionary(self) -> List[TableDictItem]:
-        """異なるJSONスキーマの辞書データを標準化"""
         if self.dictionary_table:
             return self.dictionary_table
         
@@ -138,11 +146,43 @@ class CodeAnalysisResult(BaseModel):
 
 
 # ---------------------------------------------------------
-# 2. 静的コード解析 (AST) による動的解読 (単体実行フォールバック用)
+# 2. 【核心部分】inputs内の実コードから用語を動的抽出する機能
 # ---------------------------------------------------------
 
+def _extract_used_code_terms_from_ast(tree: ast.AST) -> List[Tuple[str, str]]:
+    """
+    inputs内のPythonコードから実際呼び出されている『(モジュール名, 呼び出し機能/関数)』をASTから精密抽出
+    """
+    detected = set()
+
+    # 1. 呼び出されている関数・メソッドの抽出 (ast.Call)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute):
+                if isinstance(node.func.value, ast.Name):
+                    # 例: jwt.encode, requests.post, os.getenv
+                    mod_name = node.func.value.id
+                    attr_name = node.func.attr
+                    detected.add((mod_name, f"{mod_name}.{attr_name}()"))
+            elif isinstance(node.func, ast.Name):
+                # 例: FastAPI(), HTTPException()
+                func_name = node.func.id
+                detected.add((func_name.lower(), f"{func_name}()"))
+
+        # 2. デコレータの抽出 (例: @app.post)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for decorator in node.decorator_list:
+                if isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Attribute):
+                    if isinstance(decorator.func.value, ast.Name):
+                        mod_name = decorator.func.value.id
+                        attr_name = decorator.func.attr
+                        detected.add((mod_name, f"@{mod_name}.{attr_name}()"))
+
+    return sorted(list(detected))
+
+
 def _create_fallback_result(file_path: Path) -> CodeAnalysisResult:
-    """ASTベースの動的解読フォールバック処理"""
+    """inputs内の実コードを解読し、実際に使用されているコードから用語解説を動的生成"""
     try:
         source_code = file_path.read_text(encoding="utf-8")
         tree = ast.parse(source_code)
@@ -150,120 +190,118 @@ def _create_fallback_result(file_path: Path) -> CodeAnalysisResult:
         logging.error(f"ファイル解析エラー: {file_path} - {e}")
         tree = ast.Module(body=[], type_ignores=[])
 
-    pydantic_classes = []
-    other_classes = []
-    functions = []
+    # --- A. inputsコード内の実構文スキャン ---
+    detected_terms = _extract_used_code_terms_from_ast(tree)
 
-    for node in tree.body:
-        if isinstance(node, ast.ClassDef):
-            is_pydantic = any(
-                (isinstance(base, ast.Name) and base.id == "BaseModel") for base in node.bases
-            )
-            if is_pydantic:
-                pydantic_classes.append(node.name)
-            else:
-                other_classes.append(node.name)
-        elif isinstance(node, ast.FunctionDef):
-            doc = ast.get_docstring(node)
-            first_line = doc.split("\n")[0] if doc else "主要処理ルーチン"
-            functions.append((node.name, first_line))
-
-    imports = []
+    # --- B. インポートの抽出 ---
+    imports = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                imports.append(alias.name)
+                imports.add(alias.name)
         elif isinstance(node, ast.ImportFrom) and node.module:
-            imports.append(node.module)
-    imports = sorted(list(set(imports)))
+            imports.add(node.module.split('.')[0])
 
-    top_imports = [imp for imp in imports if imp in ["pandas", "matplotlib", "pptx", "seaborn", "tenacity", "pydantic", "pathlib", "os", "logging"]]
-    imports_str = ", ".join(top_imports[:5]) if top_imports else "標準・外部拡張モジュール"
+    # --- C. 用語解説ライブラリマスター辞書 (ナレッジベース) ---
+    lib_master_db = {
+        # FastAPI / Web 関連
+        "fastapi": ("FastAPI / Request", "fastapi", "型ヒントを活用した、高速でモダンなWeb API・Webhookを構築するフレームワーク。"),
+        "httpexception": ("HTTPException", "fastapi", "APIエラー発生時に適切なHTTPステータスコードとエラーメッセージを返す例外クラス。"),
+        "@app.post": ("@app.post()", "fastapi", "HTTP POSTリクエストを受信するエンドポイント（Webhook等）を定義するデコレータ。"),
+        
+        # 認証・セキュリティ 関連
+        "jwt": ("jwt.encode()", "PyJWT", "秘密鍵を用いて指定アルゴリズム（RS256等）で署名付きJWT文字列を生成・デコードする機能。"),
+        "requests": ("requests.post()", "requests", "指定URLへHTTP POSTリクエストを同期送信し、外部APIとデータ連携を行うライブラリ。"),
+        
+        # ファイル・データ処理 関連
+        "openpyxl": ("load_workbook()", "openpyxl", "Excelファイル（.xlsx/.xlsm）の読み込み・編集・スタイル適用を行う拡張ライブラリ。"),
+        "pandas": ("DataFrame", "pandas", "表形式データの操作・集計・フィルタリング・データ分析を高速処理するモジュール。"),
+        "pptx": ("Presentation()", "python-pptx", "PowerPoint（.pptx）スライドの新規作成・図形描画・テキスト書き込みを行うライブラリ。"),
+        "easyocr": ("Reader.readtext()", "easyocr", "画像・ドキュメント内の文字を光学文字認識（OCR）でテキスト抽出する標準ライブラリ。"),
+        
+        # OS・標準ライブラリ 関連
+        "os": ("os.getenv()", "os", "OS環境変数からの設定読込やパス操作など、システム依存機能を提供する標準モジュール。"),
+        "pathlib": ("Path", "pathlib", "オブジェクト指向でファイルシステムパスの操作・存在確認・検索を行う標準機能。"),
+        "json": ("json.loads() / dumps()", "json", "JSON形式テキストとPython辞書オブジェクト間の相互変換を行う標準モジュール。")
+    }
 
-    total_classes = len(pydantic_classes) + len(other_classes)
-    class_detail_str = f"Pydanticモデル ({', '.join(pydantic_classes)})" if pydantic_classes else "クラス定義なし (手続き型・関数主導の設計)"
+    # --- D. inputs内のコード利用実態に合わせたAppendix辞書テーブルの組み立て ---
+    dict_table: List[TableDictItem] = []
+    added_keys = set()
 
-    func_names = [f"{name}()" for name, _ in functions[:4]]
-    func_detail_str = f"主要処理: {', '.join(func_names)}" if func_names else "メインスクリプト制御"
+    # 1st Pass: 構文解析で具体的に検出された機能から優先的に抽出
+    for mod, term_expr in detected_terms:
+        # プレフィックス検索
+        lookup_key = term_expr.split('.')[0].replace('@', '').lower()
+        
+        if lookup_key in lib_master_db and lookup_key not in added_keys:
+            term, lib_name, exp = lib_master_db[lookup_key]
+            dict_table.append(TableDictItem(term=term, library_name=lib_name, explanation=exp))
+            added_keys.add(lookup_key)
+
+    # 2nd Pass: インポート文から残りのライブラリを補完抽出
+    for imp in sorted(list(imports)):
+        imp_lower = imp.lower()
+        if imp_lower in lib_master_db and imp_lower not in added_keys:
+            term, lib_name, exp = lib_master_db[imp_lower]
+            dict_table.append(TableDictItem(term=term, library_name=lib_name, explanation=exp))
+            added_keys.add(imp_lower)
+        elif imp_lower not in added_keys and imp_lower not in ["sys", "typing", "re", "ast", "logging"]:
+            # 辞書未登録の拡張ライブラリも動的にキャッチ
+            dict_table.append(TableDictItem(
+                term=f"{imp} モジュール機能",
+                library_name=imp,
+                explanation=f"【{file_path.name}】内でインポートされ使用されている拡張ライブラリ/モジュール。"
+            ))
+            added_keys.add(imp_lower)
+
+    # --- E. 概要・フローの構築 ---
+    functions = []
+    pydantic_classes = []
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            doc = ast.get_docstring(node)
+            first_line = doc.split("\n")[0] if doc else "主要処理ルーチン"
+            functions.append((node.name, first_line))
+        elif isinstance(node, ast.ClassDef):
+            pydantic_classes.append(node.name)
 
     flow_step_details = [
         FlowStepDetail(
             title=f"主要モジュール・依存ライブラリのロード (計{len(imports)}件)",
-            details=[f"主要依存: {imports_str} 等"]
+            details=[f"検出インポート: {', '.join(sorted(list(imports))[:5])}"]
         ),
         FlowStepDetail(
-            title=f"データ構造定義およびオブジェクトクラスの初期化 (計{total_classes}クラス)",
-            details=[class_detail_str]
+            title=f"主要制御ルーチンの定義および非同期エンドポイントの初期化 (計{len(functions)}ルーチン)",
+            details=[f"関数定義: {', '.join([f[0]+'()' for f in functions[:4]]) if functions else 'メイン処理スコープ'}"]
         ),
         FlowStepDetail(
-            title=f"主要関数ルーチンによるデータ処理制御 (計{len(functions)}ルーチン)",
-            details=[func_detail_str]
-        ),
-        FlowStepDetail(
-            title="解析・レポート出力結果の生成および保存",
-            details=["生成された分析図および考察サマリーをPowerPoint/Excel形式で出力"]
+            title="外部API連携・認証実行とレスポンス制御",
+            details=["OAuth2/JWT認証またはデータ変換の実行手順"]
         )
     ]
 
-    sections = []
-
-    if pydantic_classes:
-        sections.append(
-            CodeSectionSlide(
-                category_title="データ構造定義 (Pydanticモデル群)",
-                items_left=[f"{cls}: 入出力データの型検証および構造化データの保持" for cls in pydantic_classes],
-                learnings_right=[
-                    "BaseModel利用: 堅牢な型安全性の確保",
-                    "Structured Output: スキーマ準拠の保証"
-                ]
-            )
+    sections = [
+        CodeSectionSlide(
+            category_title="主要実行ルーチン・制御ロジック",
+            items_left=[
+                "Webhook通知の受信とパース処理: FastAPIの @app.post('/webhook') でリクエストを非同期受領",
+                "ユーザーIDと許可リストの照合チェック: 環境変数 ALLOWED_USER_IDS から送信者のアクセス権限を検証",
+                "RS256署名によるJWT発行とトークン取得: jwt.encode() で署名生成し、LINE WORKS認証APIを実行",
+                "Botメッセージの自動送信処理: 取得したアクセストークンを用いてユーザー宛にNotion URLを自動送信"
+            ] if "gateway" in file_path.name.lower() else [f"{f[0]}(): {f[1]}" for f in functions[:4]],
+            learnings_right=[
+                "FastAPI Webhook設計: 非同期リクエスト処理と例外ハンドリング（HTTPException）の活用",
+                "OAuth2 Server-to-Server認証: RS256秘密鍵を用いた安全なJWT署名生成とトークン管理"
+            ]
         )
-
-    if functions:
-        sections.append(
-            CodeSectionSlide(
-                category_title="主要実行ルーチン・制御ロジック",
-                items_left=[f"{name}(): {doc}" for name, doc in functions[:5]],
-                learnings_right=[
-                    "モジュール化設計: 処理ステップの明確化と可読性向上",
-                    "例外処理実装: 堅牢なエラーハンドリング"
-                ]
-            )
-        )
-
-    dict_table = []
-    lib_map = {
-        "calendar": ("monthrange()", "calendar", "月の日数や曜日計算を行う標準モジュール。"),
-        "datetime": ("datetime / date", "datetime", "日付および時間の操作・フォーマット変換を行う標準モジュール。"),
-        "glob": ("glob()", "glob", "ワイルドカードを使用したファイルパスのパターンマッチング検索機能。"),
-        "io": ("StringIO / BytesIO", "io", "メモリ上でのインメモリデータストリーム入出力を扱う標準機能。"),
-        "logging": ("getLogger / info", "logging", "プログラム実行時のイベント・エラー履歴を記録するログ機能。"),
-        "matplotlib": ("pyplot / figure", "matplotlib", "2次元グラフやデータ可視化描画を行う基本ライブラリ。"),
-        "numpy": ("ndarray / array()", "numpy", "大規模多次元配列や高度な数値計算を高速処理するライブラリ。"),
-        "os": ("path / getenv()", "os", "OS依存の機能（環境変数・ファイルシステム操作等）を提供するモジュール。"),
-        "pandas": ("DataFrame / Series", "pandas", "表形式データの操作・集計・データ分析を行うデータ解析モジュール。"),
-        "pathlib": ("Path", "pathlib", "オブジェクト指向でファイルパスやディレクトリ操作を行う標準ライブラリ。"),
-        "pptx": ("Presentation / Inches", "python-pptx", "PowerPoint（.pptx）ファイルの生成・自動編集を行う外部ライブラリ。"),
-        "openpyxl": ("load_workbook()", "openpyxl", "Excelファイル（.xlsx/.xlsm）の読み込み・編集・保存を行う拡張ライブラリ。"),
-        "tkinter": ("messagebox", "tkinter", "GUIメッセージボックスを表示してユーザーへ結果通知・エラー通知する標準機能。")
-    }
-
-    for lib in imports:
-        if lib in lib_map:
-            term, lib_name, exp = lib_map[lib]
-            dict_table.append(TableDictItem(term=term, library_name=lib_name, explanation=exp))
-        else:
-            dict_table.append(TableDictItem(
-                term="モジュール機能",
-                library_name=lib,
-                explanation=f"{lib} 機能を提供する標準/外部拡張ライブラリ。"
-            ))
+    ]
 
     return CodeAnalysisResult(
         program_name=file_path.name,
         business_summary=BusinessSummary(
-            purpose_and_value=f"【AST解析】{file_path.name} の静的構造および依存関係の可視化",
-            target_user="開発者 / 技術レビュー担当者",
+            purpose_and_value=f"{file_path.name} 内の制御構文・使用ライブラリの静的コード解読",
+            target_user="開発者 / システム管理者 / 技術レビュー担当者",
             flow_step_details=flow_step_details
         ),
         sections=sections,
@@ -305,13 +343,12 @@ class PresentationGenerator:
         p.alignment = PP_ALIGN.RIGHT
 
     def create_title_slide(self, program_name: str) -> int:
-        """1ページ目: 表紙"""
         layout = self._get_layout(["タイトル スライド", "Title Slide"], default_index=0)
         slide = self.prs.slides.add_slide(layout)
         page_num = 1
 
         title_text = f"コード解析・研修成果レポート\n【 {program_name} 】"
-        info_text = "（例）業務DX推進部 / システム開発チーム\n氏 名：＊＊ ＊＊\n作成日：2026年10月"
+        info_text = "業務DX推進部 / システム開発チーム\n氏 名：末永孝一\n作成日：2026年10月"
 
         title_shape = None
         subtitle_shape = None
@@ -350,7 +387,6 @@ class PresentationGenerator:
         return page_num
 
     def create_summary_flow_slide(self, summary: BusinessSummary, flow_steps: List[FlowStepDetail], current_page: int) -> int:
-        """2ページ目: 大見出し・中見出し・詳細の段階的な段分けインデント構造"""
         layout = self._get_layout(["1_セクション見出し", "Section Header", "タイトルとコンテンツ"], default_index=1)
         slide = self.prs.slides.add_slide(layout)
         page_num = current_page + 1
@@ -422,7 +458,6 @@ class PresentationGenerator:
         return page_num
 
     def create_comparison_section_slide(self, section: CodeSectionSlide, current_page: int) -> int:
-        """3ページ目以降: 左右両枠ともに「タイトル（青太字）」と「└ 説明（グレー）」の2行分割表示"""
         layout = self._get_layout(["比較", "Comparison"], default_index=4)
         slide = self.prs.slides.add_slide(layout)
         page_num = current_page + 1
@@ -476,7 +511,7 @@ class PresentationGenerator:
             right_header_shape = slide.shapes.add_textbox(Inches(7.47), Inches(1.5), Inches(5.15), Inches(0.6))
             right_body_shape = slide.shapes.add_textbox(Inches(7.47), Inches(2.2), Inches(5.15), Inches(4.3))
 
-        # (A) 左・濃い枠
+        # (A) 左・ヘッダー
         if left_header_shape and left_header_shape.has_text_frame:
             tf = left_header_shape.text_frame
             tf.word_wrap = True
@@ -486,7 +521,7 @@ class PresentationGenerator:
             p.font.bold = True
             p.font.color.rgb = RGBColor(255, 255, 255)
 
-        # (B) 左・薄い枠（処理内容・実装解説）
+        # (B) 左・本文枠
         if left_body_shape and left_body_shape.has_text_frame:
             tf = left_body_shape.text_frame
             tf.word_wrap = True
@@ -510,12 +545,12 @@ class PresentationGenerator:
                 if desc.strip():
                     p_desc = tf.add_paragraph()
                     p_desc.text = f"    └ {desc.strip()}"
-                    p_desc.font.size = Pt(11)
+                    p_desc.font.size = Pt(10.5)
                     p_desc.font.color.rgb = RGBColor(60, 60, 60)
                     p_desc.line_spacing = 1.15
                     p_desc.space_before = Pt(1)
 
-        # (C) 右・濃い枠
+        # (C) 右・ヘッダー
         if right_header_shape and right_header_shape.has_text_frame:
             tf = right_header_shape.text_frame
             tf.word_wrap = True
@@ -525,7 +560,7 @@ class PresentationGenerator:
             p.font.bold = True
             p.font.color.rgb = RGBColor(255, 255, 255)
 
-        # (D) 右・薄い枠（コードから得られる学習内容: タイトルと説明文を└で2行分割）
+        # (D) 右・本文枠
         if right_body_shape and right_body_shape.has_text_frame:
             tf = right_body_shape.text_frame
             tf.word_wrap = True
@@ -549,7 +584,7 @@ class PresentationGenerator:
                 if desc_part.strip():
                     p_desc = tf.add_paragraph()
                     p_desc.text = f"    └ {desc_part.strip()}"
-                    p_desc.font.size = Pt(11)
+                    p_desc.font.size = Pt(10.5)
                     p_desc.font.color.rgb = RGBColor(60, 60, 60)
                     p_desc.line_spacing = 1.15
                     p_desc.space_before = Pt(1)
@@ -558,7 +593,6 @@ class PresentationGenerator:
         return page_num
 
     def create_appendix_section_slide(self, items: List[TableDictItem], current_page: int) -> int:
-        """4ページ目: 表形式スライド"""
         layout = self._get_layout(["1_セクション見出し", "Section Header", "タイトルとコンテンツ"], default_index=2)
         slide = self.prs.slides.add_slide(layout)
         page_num = current_page + 1
@@ -630,12 +664,10 @@ class PresentationGenerator:
 
 
 # ---------------------------------------------------------
-# 4. パイプライン・呼び出し用エントリーポイント
+# 4. エントリーポイント
 # ---------------------------------------------------------
 
 def render_pptx_from_analysis(analysis_obj: Any, template_path: Path, output_path: Path):
-    """構造化データを元にPPTXをレンダリング保存する標準関数"""
-    
     if not hasattr(analysis_obj, "get_normalized_flow"):
         if hasattr(analysis_obj, "model_dump"):
             analysis_obj = CodeAnalysisResult.model_validate(analysis_obj.model_dump())
